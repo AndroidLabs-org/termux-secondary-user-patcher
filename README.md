@@ -12,8 +12,9 @@ This makes it work, and leaves user 0 exactly as it was.**
 > **Status: pre-release, tested on a real device.** The patch series for Termux v0.118.3 is complete,
 > builds in CI, and has been checked on a real device by an Android Labs tester (Google Pixel 8a),
 > Android 17 (official Google ROM), Magisk 31.1, Multiuser Mode Device Owner Managed and
-> User-Independent. The first signed release is the remaining step, so there is no downloadable
-> release yet.
+> User-Independent. The first signed release,
+> [0.118.3-mu1](https://github.com/AndroidLabs-org/termux-secondary-user-patcher/releases/tag/v0.118.3-mu1),
+> is available; the signed release build has not been run on a device yet, only the test build.
 
 > [!IMPORTANT]
 > **Root is required in secondary users.** In user 0 no root is used or requested.
@@ -149,7 +150,10 @@ Where the root prompt appears depends on the Multiuser Mode:
 
 ## Install
 
-> Not available yet. These are the steps the first release will use.
+> Download the APK for your device from the
+> [latest release](https://github.com/AndroidLabs-org/termux-secondary-user-patcher/releases/latest)
+> (`arm64-v8a` for almost every phone) and verify it, see
+> [Verify the download](#verify-the-download).
 
 This is a **clean install with no data migration**.
 
