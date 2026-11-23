@@ -1,0 +1,12 @@
+# Pinned upstream sources. Read by scripts/*.sh and the CI. Plain KEY=VALUE, no quoting.
+#
+# UPSTREAM_TAG / UPSTREAM_SHA: the termux-app release the patch series in patches/<UPSTREAM_TAG>/
+#   is written against. The SHA is checked after the clone, so a moved tag fails the build.
+# MU: our own revision on top of that upstream release. Release tag = v<upstream version>-mu<MU>.
+# PLUGINS: space-separated plugin names to build from their official repos (see scripts/build-plugin.sh).
+#   Empty until the plugin set for v1 is decided; each needs a PLUGIN_<NAME>_REPO/_TAG/_SHA entry.
+UPSTREAM_REPO=https://github.com/termux/termux-app.git
+UPSTREAM_TAG=v0.118.3
+UPSTREAM_SHA=5b657c6adf4304e5198951ce815fe0205dcac29c
+MU=1
+PLUGINS=

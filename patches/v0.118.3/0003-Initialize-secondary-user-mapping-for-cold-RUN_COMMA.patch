@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AndroidLabs-org <info@androidlabs.org>
+Date: Mon, 26 Oct 2026 12:00:00 +0000
+Subject: [PATCH 3/3] Initialize secondary-user mapping for cold RUN_COMMAND
+
+---
+ .../com/termux/app/RunCommandService.java     | 68 ++++++++++++++++---
+ .../app/SecondaryUserPrefixManager.java       |  2 +-
+ 2 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/app/src/main/java/com/termux/app/RunCommandService.java b/app/src/main/java/com/termux/app/RunCommandService.java
+index 0ca3577f..d28350ea 100644
+--- a/app/src/main/java/com/termux/app/RunCommandService.java
++++ b/app/src/main/java/com/termux/app/RunCommandService.java
+@@ -25,6 +25,9 @@ import com.termux.shared.notification.NotificationUtils;
+ import com.termux.app.utils.PluginUtils;
+ import com.termux.shared.models.ExecutionCommand;
+ 
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
+ /**
+  * A service that receives {@link RUN_COMMAND_SERVICE#ACTION_RUN_COMMAND} intent from third party apps and
+  * plugins that contains info on command execution and forwards the extras to {@link TermuxService}
+@@ -41,7 +44,8 @@ public class RunCommandService extends Service {
+     }
+ 
+     private final IBinder mBinder = new RunCommandService.LocalBinder();
+-    private boolean mSecondaryUserPrefixReady = true;
++    private final ExecutorService mPrefixSetupExecutor = Executors.newSingleThreadExecutor();
++    private volatile boolean mDestroyed;
+ 
+     @Override
+     public IBinder onBind(Intent intent) {
+@@ -51,13 +55,6 @@ public class RunCommandService extends Service {
+     @Override
+     public void onCreate() {
+         Logger.logVerbose(LOG_TAG, "onCreate");
+-        mSecondaryUserPrefixReady = SecondaryUserPrefixManager.isReadyForTermux(this);
+-        if (!mSecondaryUserPrefixReady) {
+-            Logger.logError(LOG_TAG,
+-                "Refusing RUN_COMMAND before the secondary-user prefix mapping is verified");
+-            stopSelf();
+-            return;
+-        }
+         runStartForeground();
+     }
+ 
+@@ -65,13 +62,56 @@ public class RunCommandService extends Service {
+     public int onStartCommand(Intent intent, int flags, int startId) {
+         Logger.logDebug(LOG_TAG, "onStartCommand");
+ 
+-        if (!mSecondaryUserPrefixReady) return stopService();
+-
+         if (intent == null) return Service.START_NOT_STICKY;
+ 
+         // Run again in case service is already started and onCreate() is not called
+         runStartForeground();
+ 
++        SecondaryUserPrefixManager.Inspection inspection =
++            SecondaryUserPrefixManager.inspect(this);
++        if (inspection.secondaryUser && !inspection.ready) {
++            // A foreground service must return to the main looper promptly. Run the Magisk helper
++            // on one serialized worker, then execute the original intent only after the exact same
++            // mapping and Termux initialization used by the setup activity have succeeded.
++            Intent commandIntent = new Intent(intent);
++            mPrefixSetupExecutor.execute(() -> initializePrefixAndRun(commandIntent, startId));
++            return Service.START_NOT_STICKY;
++        }
++
++        return processRunCommand(intent);
++    }
++
++    private void initializePrefixAndRun(Intent intent, int startId) {
++        try {
++            SecondaryUserPrefixManager.SetupResult result =
++                SecondaryUserPrefixManager.setup(getApplicationContext());
++            if (!result.success) {
++                Logger.logErrorExtended(LOG_TAG,
++                    "Cold RUN_COMMAND secondary-user setup failed: " + result.summary +
++                        "\n" + result.diagnostics);
++                return;
++            }
++
++            Error initializationError = TermuxApplication.completeSecondaryUserPrefixSetup(
++                getApplicationContext());
++            if (initializationError != null) {
++                Logger.logErrorExtended(LOG_TAG,
++                    "Cold RUN_COMMAND Termux initialization failed:\n" +
++                        Error.getMinimalErrorString(initializationError));
++                return;
++            }
++
++            if (!mDestroyed) processRunCommand(intent);
++        } catch (Throwable throwable) {
++            Logger.logStackTraceWithMessage(LOG_TAG,
++                "Cold RUN_COMMAND secondary-user initialization failed", throwable);
++        } finally {
++            stopSelfResult(startId);
++        }
++    }
++
++    private int processRunCommand(Intent intent) {
++
+         ExecutionCommand executionCommand = new ExecutionCommand();
+         executionCommand.pluginAPIHelp = this.getString(R.string.error_run_command_service_api_help, RUN_COMMAND_SERVICE.RUN_COMMAND_API_HELP_URL);
+ 
+@@ -232,6 +272,14 @@ public class RunCommandService extends Service {
+         return stopService();
+     }
+ 
++    @Override
++    public void onDestroy() {
++        mDestroyed = true;
++        mPrefixSetupExecutor.shutdownNow();
++        runStopForeground();
++        super.onDestroy();
++    }
++
+     private int stopService() {
+         runStopForeground();
+         return Service.START_NOT_STICKY;
+diff --git a/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java b/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java
+index 15266f89..45abea82 100644
+--- a/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java
++++ b/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java
+@@ -178,7 +178,7 @@ public final class SecondaryUserPrefixManager {
+         return inspect(context).ready;
+     }
+ 
+-    public static SetupResult setup(Context context) {
++    public static synchronized SetupResult setup(Context context) {
+         Inspection before = inspect(context);
+         if (before.ready) {
+             return new SetupResult(true, before.summary, before.diagnostics);

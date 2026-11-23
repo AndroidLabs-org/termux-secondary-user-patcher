@@ -1,0 +1,826 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AndroidLabs-org <info@androidlabs.org>
+Date: Mon, 26 Oct 2026 12:00:00 +0000
+Subject: [PATCH 1/3] Support process-local Termux paths for secondary users
+
+---
+ app/src/main/AndroidManifest.xml              |  10 +
+ .../com/termux/app/RunCommandService.java     |  10 +
+ .../app/SecondaryUserPrefixManager.java       | 354 ++++++++++++++++++
+ .../app/SecondaryUserSetupActivity.java       | 251 +++++++++++++
+ .../java/com/termux/app/TermuxActivity.java   |  11 +
+ .../com/termux/app/TermuxApplication.java     |  11 +
+ .../java/com/termux/app/TermuxInstaller.java  |   3 +-
+ .../java/com/termux/app/TermuxService.java    |  18 +
+ app/src/main/res/values/strings.xml           |  11 +
+ 9 files changed, 678 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java
+ create mode 100644 app/src/main/java/com/termux/app/SecondaryUserSetupActivity.java
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 992de637..1fa0ca8a 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -82,6 +82,16 @@
+             </intent-filter>
+         </activity-alias>
+ 
++        <activity
++            android:name=".app.SecondaryUserSetupActivity"
++            android:configChanges="orientation|screenSize|smallestScreenSize|density|screenLayout|keyboard|keyboardHidden|navigation"
++            android:excludeFromRecents="true"
++            android:exported="false"
++            android:label="@string/secondary_user_setup_title"
++            android:resizeableActivity="true"
++            android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
++            tools:targetApi="n" />
++
+         <activity
+             android:name=".app.activities.HelpActivity"
+             android:exported="false"
+diff --git a/app/src/main/java/com/termux/app/RunCommandService.java b/app/src/main/java/com/termux/app/RunCommandService.java
+index 7939d9c5..0ca3577f 100644
+--- a/app/src/main/java/com/termux/app/RunCommandService.java
++++ b/app/src/main/java/com/termux/app/RunCommandService.java
+@@ -41,6 +41,7 @@ public class RunCommandService extends Service {
+     }
+ 
+     private final IBinder mBinder = new RunCommandService.LocalBinder();
++    private boolean mSecondaryUserPrefixReady = true;
+ 
+     @Override
+     public IBinder onBind(Intent intent) {
+@@ -50,6 +51,13 @@ public class RunCommandService extends Service {
+     @Override
+     public void onCreate() {
+         Logger.logVerbose(LOG_TAG, "onCreate");
++        mSecondaryUserPrefixReady = SecondaryUserPrefixManager.isReadyForTermux(this);
++        if (!mSecondaryUserPrefixReady) {
++            Logger.logError(LOG_TAG,
++                "Refusing RUN_COMMAND before the secondary-user prefix mapping is verified");
++            stopSelf();
++            return;
++        }
+         runStartForeground();
+     }
+ 
+@@ -57,6 +65,8 @@ public class RunCommandService extends Service {
+     public int onStartCommand(Intent intent, int flags, int startId) {
+         Logger.logDebug(LOG_TAG, "onStartCommand");
+ 
++        if (!mSecondaryUserPrefixReady) return stopService();
++
+         if (intent == null) return Service.START_NOT_STICKY;
+ 
+         // Run again in case service is already started and onCreate() is not called
+diff --git a/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java b/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java
+new file mode 100644
+index 00000000..15266f89
+--- /dev/null
++++ b/app/src/main/java/com/termux/app/SecondaryUserPrefixManager.java
+@@ -0,0 +1,354 @@
++package com.termux.app;
++
++import android.content.Context;
++import android.os.Build;
++import android.os.Process;
++import android.os.UserManager;
++import android.system.ErrnoException;
++import android.system.Os;
++import android.system.OsConstants;
++import android.system.StructStat;
++
++import com.termux.BuildConfig;
++import com.termux.shared.termux.TermuxConstants;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Establishes the process-local path mapping required by Termux's historical hardcoded
++ * {@code /data/data/com.termux} paths when the app runs as a secondary Android user.
++ *
++ * <p>The root helper is deliberately defensive: it asks MagiskSU to enter this app process's
++ * mount namespace, refuses shared/global namespaces, verifies source ownership and inode
++ * identity, and rolls back a newly-created mapping if any postcondition fails.</p>
++ */
++public final class SecondaryUserPrefixManager {
++
++    private static final int ANDROID_UIDS_PER_USER = 100000;
++    private static final int MAX_HELPER_OUTPUT_BYTES = 16 * 1024;
++    private static final long ROOT_HELPER_TIMEOUT_SECONDS = 90L;
++
++    /**
++     * Inode identity alone is not sufficient: a global mapping would have the same identity.
++     * This is set only after the root helper has verified namespace isolation in this process.
++     */
++    private static volatile boolean sRootSafetyVerified;
++
++    private SecondaryUserPrefixManager() {}
++
++    public static final class Inspection {
++        public final boolean secondaryUser;
++        public final boolean ready;
++        public final int userId;
++        public final String actualFilesPath;
++        public final String summary;
++        public final String diagnostics;
++
++        private Inspection(boolean secondaryUser, boolean ready, int userId,
++                           String actualFilesPath, String summary, String diagnostics) {
++            this.secondaryUser = secondaryUser;
++            this.ready = ready;
++            this.userId = userId;
++            this.actualFilesPath = actualFilesPath;
++            this.summary = summary;
++            this.diagnostics = diagnostics;
++        }
++    }
++
++    public static final class SetupResult {
++        public final boolean success;
++        public final String summary;
++        public final String diagnostics;
++
++        private SetupResult(boolean success, String summary, String diagnostics) {
++            this.success = success;
++            this.summary = summary;
++            this.diagnostics = diagnostics;
++        }
++    }
++
++    public static Inspection inspect(Context context) {
++        int appUid = Process.myUid();
++        int userId = appUid / ANDROID_UIDS_PER_USER;
++        String diagnostics =
++            "Termux version: " + BuildConfig.VERSION_NAME +
++            "\nProcess UID: " + appUid +
++            "\nAndroid user: " + userId +
++            "\nProcess PID: " + Process.myPid() + "\n";
++
++        if (!TermuxConstants.TERMUX_PACKAGE_NAME.equals(context.getPackageName()) ||
++            !BuildConfig.APPLICATION_ID.equals(context.getPackageName())) {
++            return new Inspection(userId != 0, false, userId, null,
++                "Unexpected application package",
++                diagnostics + "Package: " + context.getPackageName() +
++                    "\nExpected: " + TermuxConstants.TERMUX_PACKAGE_NAME);
++        }
++
++        if (userId == 0) {
++            return new Inspection(false, true, 0, null,
++                "Primary Android user; no mapping required", diagnostics + "Mapping: bypassed");
++        }
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
++            UserManager userManager = (UserManager) context.getSystemService(Context.USER_SERVICE);
++            if (userManager == null || !userManager.isUserUnlocked()) {
++                return new Inspection(true, false, userId, null,
++                    "The secondary user must be unlocked",
++                    diagnostics + "User unlocked: false\nUnlock this Android user and retry.");
++            }
++        }
++
++        File filesDir = context.getFilesDir();
++        if (filesDir == null) {
++            return new Inspection(true, false, userId, null,
++                "Android did not provide the app files directory",
++                diagnostics + "Files directory: null");
++        }
++
++        String actualFilesPath = filesDir.getAbsolutePath();
++        String expectedFilesPath = "/data/user/" + userId + "/com.termux/files";
++        if (!expectedFilesPath.equals(actualFilesPath)) {
++            return new Inspection(true, false, userId, actualFilesPath,
++                "Unsupported app-data path",
++                diagnostics + "Actual files path: " + actualFilesPath +
++                    "\nExpected: " + expectedFilesPath + "\nNo mount was attempted.");
++        }
++
++        try {
++            StructStat actualStat = Os.stat(actualFilesPath);
++            if (!OsConstants.S_ISDIR(actualStat.st_mode) || actualStat.st_uid != appUid ||
++                !filesDir.canRead() || !filesDir.canWrite() || !filesDir.canExecute()) {
++                return new Inspection(true, false, userId, actualFilesPath,
++                    "The secondary-user files directory failed ownership or access checks",
++                    diagnostics + "Actual files path: " + actualFilesPath +
++                        "\nOwner UID: " + actualStat.st_uid +
++                        "\nExpected UID: " + appUid +
++                        "\nDirectory: " + OsConstants.S_ISDIR(actualStat.st_mode) +
++                        "\nReadable/writable/searchable: " + filesDir.canRead() + "/" +
++                        filesDir.canWrite() + "/" + filesDir.canExecute());
++            }
++
++            try {
++                File hardcodedFilesDir = new File("/data/data/com.termux/files");
++                StructStat hardcodedStat = Os.stat(hardcodedFilesDir.getAbsolutePath());
++                boolean identityMatches = actualStat.st_dev == hardcodedStat.st_dev &&
++                    actualStat.st_ino == hardcodedStat.st_ino;
++                boolean mappedPathAccessible = identityMatches && hardcodedStat.st_uid == appUid &&
++                    OsConstants.S_ISDIR(hardcodedStat.st_mode) && hardcodedFilesDir.canRead() &&
++                    hardcodedFilesDir.canWrite() && hardcodedFilesDir.canExecute();
++
++                if (mappedPathAccessible && sRootSafetyVerified) {
++                    return new Inspection(true, true, userId, actualFilesPath,
++                        "Secondary-user prefix mapping verified",
++                        diagnostics + "Actual files path: " + actualFilesPath +
++                            "\nHardcoded files path: /data/data/com.termux/files" +
++                            "\nIdentity check: same device and inode\nMapping: ready");
++                }
++
++                String summary = mappedPathAccessible
++                    ? "The path identity is correct, but namespace safety is not verified"
++                    : "The Termux hardcoded path is not mapped to this user";
++                return new Inspection(true, false, userId, actualFilesPath, summary,
++                    diagnostics + "Actual files path: " + actualFilesPath +
++                        "\nHardcoded files path: /data/data/com.termux/files" +
++                        "\nIdentity check: " + (identityMatches ? "match" : "mismatch") +
++                        "\nNamespace safety: " +
++                        (sRootSafetyVerified ? "verified" : "not verified") +
++                        "\nMapping: required");
++            } catch (ErrnoException e) {
++                return new Inspection(true, false, userId, actualFilesPath,
++                    "The Termux hardcoded path is not accessible yet",
++                    diagnostics + "Actual files path: " + actualFilesPath +
++                        "\nHardcoded files path: /data/data/com.termux/files" +
++                        "\nAlias stat errno: " + e.errno + "\nMapping: required");
++            }
++        } catch (ErrnoException e) {
++            return new Inspection(true, false, userId, actualFilesPath,
++                "Cannot inspect the secondary-user files directory",
++                diagnostics + "Actual files path: " + actualFilesPath +
++                    "\nstat errno: " + e.errno);
++        }
++    }
++
++    public static boolean isReadyForTermux(Context context) {
++        return inspect(context).ready;
++    }
++
++    public static SetupResult setup(Context context) {
++        Inspection before = inspect(context);
++        if (before.ready) {
++            return new SetupResult(true, before.summary, before.diagnostics);
++        }
++        if (!before.secondaryUser || before.actualFilesPath == null) {
++            return new SetupResult(false, before.summary, before.diagnostics);
++        }
++        String expectedFilesPath =
++            "/data/user/" + before.userId + "/com.termux/files";
++        if (!expectedFilesPath.equals(before.actualFilesPath)) {
++            return new SetupResult(false, before.summary, before.diagnostics);
++        }
++
++        java.lang.Process rootProcess = null;
++        try {
++            ProcessBuilder builder = new ProcessBuilder(findSuCommand(), "-t",
++                String.valueOf(Process.myPid()), "-c",
++                buildRootScript(before.userId, Process.myUid(), Process.myPid()));
++            builder.redirectErrorStream(true);
++            builder.environment().put("PATH", "/system/bin:/system/xbin");
++            rootProcess = builder.start();
++
++            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(ROOT_HELPER_TIMEOUT_SECONDS);
++            while (true) {
++                try {
++                    int exitCode = rootProcess.exitValue();
++                    String helperOutput = readLimited(rootProcess.getInputStream());
++                    if (exitCode == 0) sRootSafetyVerified = true;
++
++                    Inspection after = inspect(context);
++                    if (!after.ready) sRootSafetyVerified = false;
++
++                    String diagnostics = before.diagnostics + "\n\nRoot helper output:\n" +
++                        (helperOutput.isEmpty() ? "(none)" : helperOutput.trim()) +
++                        "\n\nPost-check:\n" + after.diagnostics;
++                    if (exitCode != 0) {
++                        return new SetupResult(false, explainRootFailure(exitCode),
++                            diagnostics + "\nRoot helper exit code: " + exitCode);
++                    }
++                    if (!after.ready) {
++                        return new SetupResult(false,
++                            "Root helper finished, but the app-side identity check failed",
++                            diagnostics);
++                    }
++                    return new SetupResult(true,
++                        "Secondary-user prefix mapping verified", diagnostics);
++                } catch (IllegalThreadStateException ignored) {
++                    if (System.nanoTime() >= deadline) {
++                        rootProcess.destroy();
++                        return new SetupResult(false, "Timed out waiting for Magisk",
++                            before.diagnostics +
++                                "\nRoot helper: timed out after 90 seconds");
++                    }
++                    Thread.sleep(100L);
++                }
++            }
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            if (rootProcess != null) rootProcess.destroy();
++            return new SetupResult(false, "Setup was interrupted",
++                before.diagnostics + "\nRoot helper: interrupted");
++        } catch (Exception e) {
++            if (rootProcess != null) rootProcess.destroy();
++            return new SetupResult(false, "Unable to start Magisk su",
++                before.diagnostics + "\nRoot helper error: " + e.getClass().getSimpleName() +
++                    (e.getMessage() == null ? "" : ": " + e.getMessage()));
++        }
++    }
++
++    private static String findSuCommand() {
++        File systemSu = new File("/system/bin/su");
++        if (systemSu.canExecute()) return systemSu.getAbsolutePath();
++        File systemXbinSu = new File("/system/xbin/su");
++        return systemXbinSu.canExecute() ? systemXbinSu.getAbsolutePath() : "su";
++    }
++
++    static String buildRootScript(int userId, int appUid, int appPid) {
++        if (userId <= 0 || appUid <= 0 || appPid <= 0 ||
++            appUid / ANDROID_UIDS_PER_USER != userId) {
++            throw new IllegalArgumentException("Invalid secondary-user process identity");
++        }
++        return "PATH=/system/bin:/system/xbin\n" +
++            "USER_ID=" + userId + "\n" +
++            "APP_UID=" + appUid + "\n" +
++            "APP_PID=" + appPid + "\n" +
++            "SOURCE_ROOT=/data/user/$USER_ID\n" +
++            "SOURCE_FILES=$SOURCE_ROOT/com.termux/files\n" +
++            "TARGET_ROOT=/data/data\n" +
++            "TARGET_FILES=$TARGET_ROOT/com.termux/files\n" +
++            "fail() { echo \"POC_ERROR:$1\"; exit \"$2\"; }\n" +
++            "cleanup_fail() { /system/bin/umount \"$TARGET_ROOT\" >/dev/null 2>&1; echo \"POC_ERROR:$1\"; exit \"$2\"; }\n" +
++            "[ \"$(/system/bin/id -u)\" = 0 ] || fail not-root 20\n" +
++            "[ -d \"$SOURCE_FILES\" ] || fail source-files-missing 21\n" +
++            "SOURCE_UID=$(/system/bin/stat -c %u \"$SOURCE_FILES\" 2>/dev/null) || fail source-stat-failed 22\n" +
++            "[ \"$SOURCE_UID\" = \"$APP_UID\" ] || fail source-owner-mismatch 23\n" +
++            "SELF_NS=$(/system/bin/readlink /proc/self/ns/mnt) || fail self-namespace-unreadable 24\n" +
++            "APP_NS=$(/system/bin/readlink /proc/$APP_PID/ns/mnt) || fail app-namespace-unreadable 25\n" +
++            "INIT_NS=$(/system/bin/readlink /proc/1/ns/mnt) || fail init-namespace-unreadable 26\n" +
++            "echo \"namespace self=$SELF_NS app=$APP_NS init=$INIT_NS\"\n" +
++            "[ \"$SELF_NS\" = \"$APP_NS\" ] || fail su-did-not-enter-app-namespace 27\n" +
++            "[ \"$SELF_NS\" != \"$INIT_NS\" ] || fail app-shares-init-namespace 28\n" +
++            "DATA_MOUNT=$(/system/bin/grep ' /data ' /proc/self/mountinfo | /system/bin/tail -n 1)\n" +
++            "[ -n \"$DATA_MOUNT\" ] || fail data-mount-not-found 29\n" +
++            "case \"$DATA_MOUNT\" in *\" shared:\"*) fail data-mount-is-shared 30;; esac\n" +
++            "INIT_BEFORE=$(/system/bin/grep ' /data/data ' /proc/1/mountinfo | /system/bin/tail -n 1)\n" +
++            "TARGET_BEFORE=$(/system/bin/grep ' /data/data ' /proc/self/mountinfo | /system/bin/tail -n 1)\n" +
++            "case \"$TARGET_BEFORE\" in *\" shared:\"*) fail target-was-shared 43;; esac\n" +
++            "SOURCE_ID=$(/system/bin/stat -c %d:%i \"$SOURCE_FILES\" 2>/dev/null) || fail source-identity-failed 31\n" +
++            "TARGET_ID=$(/system/bin/stat -c %d:%i \"$TARGET_FILES\" 2>/dev/null)\n" +
++            "INIT_TARGET_ID=$(/system/bin/stat -c %d:%i /proc/1/root/data/data/com.termux/files 2>/dev/null)\n" +
++            "if [ \"$SOURCE_ID\" = \"$TARGET_ID\" ]; then\n" +
++            "  EXISTING_TARGET_MOUNT=$(/system/bin/grep ' /data/data ' /proc/self/mountinfo | /system/bin/tail -n 1)\n" +
++            "  [ -n \"$EXISTING_TARGET_MOUNT\" ] || fail existing-target-mount-not-found 40\n" +
++            "  case \"$EXISTING_TARGET_MOUNT\" in *\" shared:\"*) fail existing-target-mount-is-shared 41;; esac\n" +
++            "  [ \"$SOURCE_ID\" != \"$INIT_TARGET_ID\" ] || fail mapping-visible-in-init-namespace 42\n" +
++            "  echo mapping=already-present; exit 0\n" +
++            "fi\n" +
++            "/system/bin/mount -o bind \"$SOURCE_ROOT\" \"$TARGET_ROOT\" || fail bind-mount-failed 32\n" +
++            "TARGET_MOUNT=$(/system/bin/grep ' /data/data ' /proc/self/mountinfo | /system/bin/tail -n 1)\n" +
++            "[ -n \"$TARGET_MOUNT\" ] || cleanup_fail target-mount-not-found 33\n" +
++            "case \"$TARGET_MOUNT\" in *\" shared:\"*) cleanup_fail target-mount-is-shared 34;; esac\n" +
++            "INIT_AFTER=$(/system/bin/grep ' /data/data ' /proc/1/mountinfo | /system/bin/tail -n 1)\n" +
++            "[ \"$INIT_BEFORE\" = \"$INIT_AFTER\" ] || cleanup_fail init-namespace-changed 35\n" +
++            "INIT_TARGET_AFTER_ID=$(/system/bin/stat -c %d:%i /proc/1/root/data/data/com.termux/files 2>/dev/null)\n" +
++            "[ \"$SOURCE_ID\" != \"$INIT_TARGET_AFTER_ID\" ] || cleanup_fail mapping-visible-in-init-namespace 42\n" +
++            "MAPPED_ID=$(/system/bin/stat -c %d:%i \"$TARGET_FILES\" 2>/dev/null) || cleanup_fail mapped-identity-failed 36\n" +
++            "MAPPED_UID=$(/system/bin/stat -c %u \"$TARGET_FILES\" 2>/dev/null) || cleanup_fail mapped-owner-stat-failed 37\n" +
++            "[ \"$SOURCE_ID\" = \"$MAPPED_ID\" ] || cleanup_fail mapped-identity-mismatch 38\n" +
++            "[ \"$MAPPED_UID\" = \"$APP_UID\" ] || cleanup_fail mapped-owner-mismatch 39\n" +
++            "echo mapping=verified\n" +
++            "exit 0\n";
++    }
++
++    private static String explainRootFailure(int exitCode) {
++        switch (exitCode) {
++            case 1:
++                return "Magisk denied or could not complete the root request";
++            case 20:
++                return "Magisk did not grant root";
++            case 27:
++                return "Set Magisk Settings > Mount namespace mode to Inherit namespace, then retry";
++            case 28:
++                return "Termux does not have a private mount namespace on this build";
++            case 30:
++            case 34:
++            case 41:
++            case 43:
++                return "The mount would not be process-local, so setup was refused";
++            case 32:
++                return "The process-local bind mount was rejected";
++            case 35:
++                return "The global mount namespace changed, so setup was rolled back";
++            case 42:
++                return "The mapping was visible globally, so setup was refused";
++            default:
++                return "The secondary-user prefix setup failed safely";
++        }
++    }
++
++    private static String readLimited(InputStream inputStream) throws Exception {
++        ByteArrayOutputStream output = new ByteArrayOutputStream();
++        byte[] buffer = new byte[1024];
++        int total = 0;
++        int count;
++        while (total < MAX_HELPER_OUTPUT_BYTES &&
++            (count = inputStream.read(buffer, 0,
++                Math.min(buffer.length, MAX_HELPER_OUTPUT_BYTES - total))) >= 0) {
++            output.write(buffer, 0, count);
++            total += count;
++        }
++        return new String(output.toByteArray(), StandardCharsets.UTF_8);
++    }
++}
+diff --git a/app/src/main/java/com/termux/app/SecondaryUserSetupActivity.java b/app/src/main/java/com/termux/app/SecondaryUserSetupActivity.java
+new file mode 100644
+index 00000000..7ad57cb5
+--- /dev/null
++++ b/app/src/main/java/com/termux/app/SecondaryUserSetupActivity.java
+@@ -0,0 +1,251 @@
++package com.termux.app;
++
++import android.content.ClipData;
++import android.content.ClipboardManager;
++import android.content.Context;
++import android.content.Intent;
++import android.graphics.Color;
++import android.graphics.Typeface;
++import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.Process;
++import android.text.method.ScrollingMovementMethod;
++import android.view.View;
++import android.widget.Button;
++import android.widget.FrameLayout;
++import android.widget.LinearLayout;
++import android.widget.ProgressBar;
++import android.widget.ScrollView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.appcompat.app.AppCompatActivity;
++
++import com.termux.R;
++import com.termux.shared.models.errors.Error;
++
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++
++/** Root-gated setup screen shown before Termux touches its hardcoded prefix paths. */
++public final class SecondaryUserSetupActivity extends AppCompatActivity {
++
++    private static final String EXTRA_ORIGINAL_INTENT =
++        "com.termux.app.extra.SECONDARY_USER_ORIGINAL_INTENT";
++
++    private final ExecutorService mExecutor = Executors.newSingleThreadExecutor();
++
++    private LinearLayout mButtonBar;
++    private TextView mDiagnosticsView;
++    private ProgressBar mProgressBar;
++    private Button mRetryButton;
++    private Future<?> mSetupFuture;
++    private volatile boolean mDestroyed;
++    private boolean mSetupRunning;
++    private TextView mStatusView;
++    private TextView mTitleView;
++    private String mDiagnostics = "";
++
++    public static Intent createIntent(Context context, Intent originalIntent) {
++        Intent intent = new Intent(context, SecondaryUserSetupActivity.class);
++        if (originalIntent != null) {
++            intent.putExtra(EXTRA_ORIGINAL_INTENT, new Intent(originalIntent));
++        }
++        return intent;
++    }
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        setContentView(createContentView());
++        runSetup();
++    }
++
++    private View createContentView() {
++        ScrollView scrollView = new ScrollView(this);
++        scrollView.setFillViewport(true);
++        scrollView.setBackgroundColor(Color.BLACK);
++
++        LinearLayout content = new LinearLayout(this);
++        content.setOrientation(LinearLayout.VERTICAL);
++        content.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
++        int horizontalPadding = dp(24);
++        content.setPadding(horizontalPadding, dp(40), horizontalPadding, horizontalPadding);
++        scrollView.addView(content, new FrameLayout.LayoutParams(
++            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
++
++        mTitleView = new TextView(this);
++        mTitleView.setText(R.string.secondary_user_setup_title);
++        mTitleView.setTextColor(Color.WHITE);
++        mTitleView.setTextSize(23f);
++        mTitleView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
++        mTitleView.setGravity(android.view.Gravity.CENTER);
++        content.addView(mTitleView, matchWrap());
++
++        mProgressBar = new ProgressBar(this);
++        LinearLayout.LayoutParams progressParams =
++            new LinearLayout.LayoutParams(dp(48), dp(48));
++        progressParams.setMargins(0, dp(28), 0, dp(24));
++        content.addView(mProgressBar, progressParams);
++
++        mStatusView = new TextView(this);
++        mStatusView.setTextColor(Color.LTGRAY);
++        mStatusView.setTextSize(16f);
++        mStatusView.setGravity(android.view.Gravity.CENTER);
++        mStatusView.setLineSpacing(0f, 1.15f);
++        content.addView(mStatusView, matchWrap());
++
++        mDiagnosticsView = new TextView(this);
++        mDiagnosticsView.setTextColor(Color.rgb(220, 220, 220));
++        mDiagnosticsView.setBackgroundColor(Color.rgb(30, 30, 30));
++        mDiagnosticsView.setTypeface(Typeface.MONOSPACE);
++        mDiagnosticsView.setTextSize(12f);
++        mDiagnosticsView.setTextIsSelectable(true);
++        mDiagnosticsView.setMovementMethod(new ScrollingMovementMethod());
++        mDiagnosticsView.setPadding(dp(12), dp(12), dp(12), dp(12));
++        mDiagnosticsView.setVisibility(View.GONE);
++        LinearLayout.LayoutParams diagnosticsParams = matchWrap();
++        diagnosticsParams.setMargins(0, dp(24), 0, 0);
++        content.addView(mDiagnosticsView, diagnosticsParams);
++
++        mButtonBar = new LinearLayout(this);
++        mButtonBar.setOrientation(LinearLayout.VERTICAL);
++        mButtonBar.setVisibility(View.GONE);
++        LinearLayout.LayoutParams buttonsParams = matchWrap();
++        buttonsParams.setMargins(0, dp(20), 0, 0);
++        content.addView(mButtonBar, buttonsParams);
++
++        mRetryButton = addButton(R.string.secondary_user_setup_retry, view -> runSetup());
++        addButton(R.string.secondary_user_setup_copy_diagnostics, view -> copyDiagnostics());
++        addButton(R.string.secondary_user_setup_exit, view -> exitAndEndProcess());
++
++        return scrollView;
++    }
++
++    private Button addButton(int textResource, View.OnClickListener listener) {
++        Button button = new Button(this);
++        button.setText(textResource);
++        button.setOnClickListener(listener);
++        LinearLayout.LayoutParams params = matchWrap();
++        params.setMargins(0, dp(4), 0, dp(4));
++        mButtonBar.addView(button, params);
++        return button;
++    }
++
++    private void runSetup() {
++        if (mSetupRunning || mDestroyed) return;
++
++        mSetupRunning = true;
++        mProgressBar.setVisibility(View.VISIBLE);
++        mButtonBar.setVisibility(View.GONE);
++        mDiagnosticsView.setVisibility(View.GONE);
++
++        SecondaryUserPrefixManager.Inspection inspection =
++            SecondaryUserPrefixManager.inspect(this);
++        mTitleView.setText(R.string.secondary_user_setup_title);
++        mStatusView.setText(getString(R.string.secondary_user_setup_body, inspection.userId));
++
++        mSetupFuture = mExecutor.submit(() -> {
++            SecondaryUserPrefixManager.SetupResult result =
++                SecondaryUserPrefixManager.setup(getApplicationContext());
++            boolean success = result.success;
++            String summary = result.summary;
++            String diagnostics = result.diagnostics;
++
++            if (success) {
++                Error error = TermuxApplication.completeSecondaryUserPrefixSetup(
++                    getApplicationContext());
++                if (error != null) {
++                    diagnostics += "\n\nTermux initialization:\n" +
++                        Error.getMinimalErrorString(error);
++                    success = false;
++                    summary = "The mapping succeeded, but Termux initialization failed";
++                }
++            }
++
++            final boolean finalSuccess = success;
++            final String finalSummary = summary;
++            final String finalDiagnostics = diagnostics;
++            runOnUiThread(() -> finishSetup(
++                finalSuccess, finalSummary, finalDiagnostics));
++        });
++    }
++
++    private void finishSetup(boolean success, String summary, String diagnostics) {
++        if (mDestroyed) return;
++
++        mSetupRunning = false;
++        mDiagnostics = diagnostics == null ? "" : diagnostics;
++        if (success) {
++            mTitleView.setText(R.string.secondary_user_setup_success_title);
++            mStatusView.setText(R.string.secondary_user_setup_success_body);
++            mProgressBar.setVisibility(View.GONE);
++            new Handler(Looper.getMainLooper()).postDelayed(this::launchTermux, 250L);
++            return;
++        }
++
++        mTitleView.setText(R.string.secondary_user_setup_failure_title);
++        mStatusView.setText(summary);
++        mProgressBar.setVisibility(View.GONE);
++        mDiagnosticsView.setText(mDiagnostics);
++        mDiagnosticsView.setVisibility(View.VISIBLE);
++        mButtonBar.setVisibility(View.VISIBLE);
++        mRetryButton.requestFocus();
++    }
++
++    private void launchTermux() {
++        if (mDestroyed || isFinishing()) return;
++
++        Intent original = getIntent().getParcelableExtra(EXTRA_ORIGINAL_INTENT);
++        Intent intent = original == null ? new Intent() : new Intent(original);
++        intent.setClass(this, TermuxActivity.class);
++        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
++        startActivity(intent);
++        finish();
++    }
++
++    private void copyDiagnostics() {
++        ClipboardManager clipboard =
++            (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
++        if (clipboard == null) return;
++
++        clipboard.setPrimaryClip(ClipData.newPlainText(
++            "Termux secondary-user setup", mDiagnostics));
++        Toast.makeText(this, R.string.secondary_user_setup_diagnostics_copied,
++            Toast.LENGTH_SHORT).show();
++    }
++
++    private void exitAndEndProcess() {
++        mDestroyed = true;
++        if (mSetupFuture != null) mSetupFuture.cancel(true);
++        finishAndRemoveTask();
++        new Handler(Looper.getMainLooper()).postDelayed(
++            () -> Process.killProcess(Process.myPid()), 150L);
++    }
++
++    @Override
++    public void onBackPressed() {
++        exitAndEndProcess();
++    }
++
++    @Override
++    protected void onDestroy() {
++        mDestroyed = true;
++        if (mSetupFuture != null && !mSetupFuture.isDone()) {
++            mSetupFuture.cancel(true);
++        }
++        mExecutor.shutdownNow();
++        super.onDestroy();
++    }
++
++    private LinearLayout.LayoutParams matchWrap() {
++        return new LinearLayout.LayoutParams(
++            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
++    }
++
++    private int dp(int value) {
++        return Math.round(value * getResources().getDisplayMetrics().density);
++    }
++}
+diff --git a/app/src/main/java/com/termux/app/TermuxActivity.java b/app/src/main/java/com/termux/app/TermuxActivity.java
+index 243e1709..0290ceeb 100644
+--- a/app/src/main/java/com/termux/app/TermuxActivity.java
++++ b/app/src/main/java/com/termux/app/TermuxActivity.java
+@@ -180,6 +180,17 @@ public final class TermuxActivity extends Activity implements ServiceConnection
+     public void onCreate(Bundle savedInstanceState) {
+ 
+         Logger.logDebug(LOG_TAG, "onCreate");
++
++        SecondaryUserPrefixManager.Inspection inspection =
++            SecondaryUserPrefixManager.inspect(this);
++        if (inspection.secondaryUser && !inspection.ready) {
++            super.onCreate(savedInstanceState);
++            mIsInvalidState = true;
++            startActivity(SecondaryUserSetupActivity.createIntent(this, getIntent()));
++            finish();
++            return;
++        }
++
+         isOnResumeAfterOnCreate = true;
+ 
+         // Check if a crash happened on last run of the app and show a
+diff --git a/app/src/main/java/com/termux/app/TermuxApplication.java b/app/src/main/java/com/termux/app/TermuxApplication.java
+index b7f28980..3f882a48 100644
+--- a/app/src/main/java/com/termux/app/TermuxApplication.java
++++ b/app/src/main/java/com/termux/app/TermuxApplication.java
+@@ -1,7 +1,9 @@
+ package com.termux.app;
+ 
+ import android.app.Application;
++import android.content.Context;
+ 
++import com.termux.shared.models.errors.Error;
+ import com.termux.shared.crash.TermuxCrashUtils;
+ import com.termux.shared.settings.preferences.TermuxAppSharedPreferences;
+ import com.termux.shared.logger.Logger;
+@@ -18,6 +20,15 @@ public class TermuxApplication extends Application {
+         setLogLevel();
+     }
+ 
++    /**
++     * Finish the path-dependent application initialization after the secondary-user mapping.
++     * The master-based POC deferred termux-am-socket and TermuxShellEnvironment setup here; v0.118.3
++     * has no such Application-level initialization, so there is nothing left to complete.
++     */
++    public static Error completeSecondaryUserPrefixSetup(Context context) {
++        return null;
++    }
++
+     private void setLogLevel() {
+         // Load the log level from shared preferences and set it to the {@link Logger.CURRENT_LOG_LEVEL}
+         TermuxAppSharedPreferences preferences = TermuxAppSharedPreferences.build(getApplicationContext());
+diff --git a/app/src/main/java/com/termux/app/TermuxInstaller.java b/app/src/main/java/com/termux/app/TermuxInstaller.java
+index 98157a05..d94f087f 100644
+--- a/app/src/main/java/com/termux/app/TermuxInstaller.java
++++ b/app/src/main/java/com/termux/app/TermuxInstaller.java
+@@ -74,7 +74,8 @@ final class TermuxInstaller {
+ 
+         // Termux can only be run as the primary user (device owner) since only that
+         // account has the expected file system paths. Verify that:
+-        if (!PackageUtils.isCurrentUserThePrimaryUser(activity)) {
++        if (!PackageUtils.isCurrentUserThePrimaryUser(activity) &&
++            !SecondaryUserPrefixManager.isReadyForTermux(activity)) {
+             bootstrapErrorMessage = activity.getString(R.string.bootstrap_error_not_primary_user_message, MarkdownUtils.getMarkdownCodeForString(TERMUX_PREFIX_DIR_PATH, false));
+             Logger.logError(LOG_TAG, "isFilesDirectoryAccessible: " + isFilesDirectoryAccessible);
+             Logger.logError(LOG_TAG, bootstrapErrorMessage);
+diff --git a/app/src/main/java/com/termux/app/TermuxService.java b/app/src/main/java/com/termux/app/TermuxService.java
+index f7034e28..395868b4 100644
+--- a/app/src/main/java/com/termux/app/TermuxService.java
++++ b/app/src/main/java/com/termux/app/TermuxService.java
+@@ -113,11 +113,22 @@ public final class TermuxService extends Service implements TermuxTask.TermuxTas
+ 
+     public Integer mTerminalTranscriptRows;
+ 
++    private boolean mSecondaryUserPrefixReady = true;
++
+     private static final String LOG_TAG = "TermuxService";
+ 
+     @Override
+     public void onCreate() {
+         Logger.logVerbose(LOG_TAG, "onCreate");
++
++        mSecondaryUserPrefixReady = SecondaryUserPrefixManager.isReadyForTermux(this);
++        if (!mSecondaryUserPrefixReady) {
++            Logger.logError(LOG_TAG,
++                "Refusing to start TermuxService before the secondary-user prefix mapping is verified");
++            stopSelf();
++            return;
++        }
++
+         runStartForeground();
+     }
+ 
+@@ -126,6 +137,11 @@ public final class TermuxService extends Service implements TermuxTask.TermuxTas
+     public int onStartCommand(Intent intent, int flags, int startId) {
+         Logger.logDebug(LOG_TAG, "onStartCommand");
+ 
++        if (!mSecondaryUserPrefixReady) {
++            stopSelf(startId);
++            return Service.START_NOT_STICKY;
++        }
++
+         // Run again in case service is already started and onCreate() is not called
+         runStartForeground();
+ 
+@@ -164,6 +180,8 @@ public final class TermuxService extends Service implements TermuxTask.TermuxTas
+     public void onDestroy() {
+         Logger.logVerbose(LOG_TAG, "onDestroy");
+ 
++        if (!mSecondaryUserPrefixReady) return;
++
+         TermuxShellUtils.clearTermuxTMPDIR(true);
+ 
+         actionReleaseWakeLock(false);
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 3d58b1f4..3d4f0c60 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -226,4 +226,15 @@
+     <!-- Donate Preference -->
+     <string name="donate_preference_title">Donate</string>
+ 
++    <!-- Secondary Android User Prefix Setup -->
++    <string name="secondary_user_setup_title">Preparing Termux for this Android user</string>
++    <string name="secondary_user_setup_body">Android user %1$d needs a private path mapping before Termux can start. Magisk may ask you to grant root. No files are copied, and the mapping ends when this app process stops.</string>
++    <string name="secondary_user_setup_success_title">Path mapping verified</string>
++    <string name="secondary_user_setup_success_body">Starting Termux…</string>
++    <string name="secondary_user_setup_failure_title">Termux was not changed</string>
++    <string name="secondary_user_setup_retry">Retry</string>
++    <string name="secondary_user_setup_copy_diagnostics">Copy diagnostics</string>
++    <string name="secondary_user_setup_diagnostics_copied">Diagnostics copied</string>
++    <string name="secondary_user_setup_exit">Exit</string>
++
+ </resources>

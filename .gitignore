@@ -1,0 +1,10 @@
+# Signing material - never commit
+*.jks
+*.keystore
+*.p12
+keystore.properties
+
+# Build output
+/build/
+/out/
+.DS_Store

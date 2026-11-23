@@ -1,0 +1,25 @@
+name: Bug report
+description: Termux does not start or work in a secondary user
+body:
+  - type: input
+    id: version
+    attributes: {label: "Release (e.g. 0.118.3-mu1)"}
+    validations: {required: true}
+  - type: input
+    id: device
+    attributes: {label: "Device and Android version / ROM"}
+    validations: {required: true}
+  - type: input
+    id: root
+    attributes: {label: "Root manager and version", description: "Magisk, mount namespace mode must be Inherit"}
+    validations: {required: true}
+  - type: dropdown
+    id: user
+    attributes:
+      label: "Android user"
+      options: ["User 0 (primary)", "Secondary user (10, 11, ...)", "Work profile"]
+    validations: {required: true}
+  - type: textarea
+    id: what
+    attributes: {label: "What happened, and what did you expect?", description: "Include the text of the setup screen if it showed one."}
+    validations: {required: true}

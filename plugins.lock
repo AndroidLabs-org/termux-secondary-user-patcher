@@ -1,0 +1,34 @@
+# Pinned sources for scripts/build-plugins.sh. Plain KEY=VALUE, no quoting.
+# This file is only for people who sign their own build. The official release does not use it.
+#
+# Termux plugins pull `termux-shared` from JitPack at a commit that JitPack has never built, so the
+# script builds it from the pinned termux-app commit below. SHARED_VERSION is the version string the
+# plugins ask for.
+PLUGINS=api styling boot widget float tasker
+SHARED_REPO=https://github.com/termux/termux-app.git
+SHARED_SHA=7bceab88e2272f961d1b94ef736f1a9e20173247
+SHARED_VERSION=7bceab88e2
+
+PLUGIN_API_REPO=https://github.com/termux/termux-api.git
+PLUGIN_API_TAG=v0.53.0
+PLUGIN_API_SHA=6c8eaa223bcc387e6b28146d340acb20712aa3e7
+
+PLUGIN_STYLING_REPO=https://github.com/termux/termux-styling.git
+PLUGIN_STYLING_TAG=v0.32.1
+PLUGIN_STYLING_SHA=82dcd3243349d1c5de9a9055b429331d1a01b388
+
+PLUGIN_BOOT_REPO=https://github.com/termux/termux-boot.git
+PLUGIN_BOOT_TAG=v0.8.1
+PLUGIN_BOOT_SHA=613dc9893f672313e2c572c0089ece7475e04f5b
+
+PLUGIN_WIDGET_REPO=https://github.com/termux/termux-widget.git
+PLUGIN_WIDGET_TAG=v0.15.0
+PLUGIN_WIDGET_SHA=289c6296ed9013ada91742726da5b7230ee74f70
+
+PLUGIN_FLOAT_REPO=https://github.com/termux/termux-float.git
+PLUGIN_FLOAT_TAG=v0.17.0
+PLUGIN_FLOAT_SHA=b435f4b671fd1702817e889ef680850a9934a05f
+
+PLUGIN_TASKER_REPO=https://github.com/termux/termux-tasker.git
+PLUGIN_TASKER_TAG=v0.9.0
+PLUGIN_TASKER_SHA=f08f83b5830c1273916d96d1ebcc70e14e520f1b

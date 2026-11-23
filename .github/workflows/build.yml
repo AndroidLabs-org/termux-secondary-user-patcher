@@ -1,0 +1,67 @@
+name: Build
+
+# Every pull request and push to main: apply the patches to the pinned upstream and build the
+# UNSIGNED release APKs. This is the gate the daily upstream-bump PR has to pass.
+# If the repository variable AUTO_RELEASE is "true", a push to main that changes upstream.lock
+# also creates the release tag and starts the Release workflow (see release.yml).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      # sdkmanager needs JDK 17; the v0.118.3 build (Gradle 7.2) needs JDK 11. Install the SDK first.
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "17" }
+      - uses: android-actions/setup-android@v4
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-30" "build-tools;30.0.3" "build-tools;36.0.0" "ndk;22.1.7171670" >/dev/null
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "11" }
+      - name: Repo hygiene
+        run: bash scripts/check-repo.sh
+      - name: Build (patches applied to the pinned upstream)
+        run: bash scripts/build.sh
+      - id: ver
+        run: echo "tag=$(bash -c '. scripts/lib.sh; load_lock; echo $RELEASE_TAG')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-apks
+          path: out/unsigned/*.apk
+          retention-days: 7
+
+  auto-release:
+    needs: build
+    if: github.event_name == 'push' && vars.AUTO_RELEASE == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
+      - name: Tag and start the release if upstream.lock changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet HEAD~1 HEAD -- upstream.lock; then echo "upstream.lock unchanged"; exit 0; fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then echo "$TAG already exists"; exit 0; fi
+          # A tag pushed with GITHUB_TOKEN does not trigger other workflows, so start Release explicitly.
+          git config user.name AndroidLabs-org; git config user.email info@androidlabs.org
+          git tag -a "$TAG" -m "$TAG"; git push origin "$TAG"
+          gh workflow run release.yml --ref "$TAG" -f tag="$TAG"

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AndroidLabs-org <info@androidlabs.org>
+Date: Mon, 26 Oct 2026 12:00:00 +0000
+Subject: [PATCH 2/3] Export actual Android user id to Termux shells
+
+---
+ .../java/com/termux/shared/shell/TermuxShellUtils.java   | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/termux-shared/src/main/java/com/termux/shared/shell/TermuxShellUtils.java b/termux-shared/src/main/java/com/termux/shared/shell/TermuxShellUtils.java
+index 5fed8073..acd180e7 100644
+--- a/termux-shared/src/main/java/com/termux/shared/shell/TermuxShellUtils.java
++++ b/termux-shared/src/main/java/com/termux/shared/shell/TermuxShellUtils.java
+@@ -24,6 +24,9 @@ import java.util.List;
+ 
+ public class TermuxShellUtils {
+ 
++    /** Number of application UIDs allocated to each Android user (UserHandle.PER_USER_RANGE). */
++    private static final int ANDROID_UIDS_PER_USER = 100000;
++
+     public static String TERMUX_VERSION_NAME;
+     public static String TERMUX_IS_DEBUGGABLE_BUILD;
+     public static String TERMUX_APP_PID;
+@@ -89,6 +92,12 @@ public class TermuxShellUtils {
+         }
+ 
+         environment.add("TERMUX__ROOTFS_DIR=" + TermuxConstants.TERMUX_FILES_DIR_PATH);
++
++        // Termux command scripts use this when addressing Android services through `am` and `pm`.
++        // Derive the actual Android user identifier from the process UID. A user serial number is
++        // a different value and may diverge after Android users are removed and recreated.
++        environment.add("TERMUX__USER_ID=" + (android.os.Process.myUid() / ANDROID_UIDS_PER_USER));
++
+         environment.add("HOME=" + TermuxConstants.TERMUX_HOME_DIR_PATH);
+         environment.add("TERMUX__HOME=" + TermuxConstants.TERMUX_HOME_DIR_PATH);
+         environment.add("PREFIX=" + TermuxConstants.TERMUX_PREFIX_DIR_PATH);

@@ -1,0 +1,3 @@
+#!/bin/sh
+# See scripts/build.sh. Reports x86_64 for `uname -m` so the NDK r22 ndk-build accepts the host.
+if [ "$1" = "-m" ]; then echo x86_64; else exec /usr/bin/uname "$@"; fi

@@ -1,0 +1,99 @@
+name: Release
+
+# A version tag (v0.118.3-mu1) builds, signs, verifies and publishes. The tag must equal
+# v<UPSTREAM_TAG without the leading v>-mu<MU> from upstream.lock, and release-notes/<tag>.md
+# must exist. The release is created as a DRAFT unless the repository variable
+# RELEASE_PUBLISH is "true" - keep it unset until the first release has been installed and
+# checked on a real device, then set it to make later (automatic) releases public.
+#
+# Secrets (Settings -> Secrets and variables -> Actions), values in docs: see README "Verify":
+#   STUP_KEYSTORE_B64  STUP_KEYSTORE_PASSWORD  STUP_KEY_ALIAS  STUP_KEY_PASSWORD
+# None is written to a log, an output or the repository; the decoded keystore is deleted at the end.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag: { description: "Release tag", required: true }
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  # SHA-256 of the AndroidLabs release certificate; published in the README and SECURITY.md.
+  EXPECTED_CERT_SHA256: dac9bda20bb9cb1a9be04fc9741d54e1ab14f09df049f911542b92e1f87c6393
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Check the tag, the lock and the release notes agree
+        run: |
+          set -euo pipefail
+          WANT=$(bash -c '. scripts/lib.sh; load_lock; echo $RELEASE_TAG')
+          [ "$TAG" = "$WANT" ] || { echo "::error::tag $TAG does not match upstream.lock ($WANT)"; exit 1; }
+          [ -f "release-notes/$TAG.md" ] || { echo "::error::release-notes/$TAG.md is missing"; exit 1; }
+          bash scripts/check-repo.sh
+
+      # sdkmanager needs JDK 17; the v0.118.3 build (Gradle 7.2) needs JDK 11. Install the SDK first.
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "17" }
+      - uses: android-actions/setup-android@v4
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-30" "build-tools;30.0.3" "build-tools;36.0.0" "ndk;22.1.7171670" >/dev/null
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "11" }
+
+      - name: Build
+        run: bash scripts/build.sh
+
+      - name: Decode the keystore
+        run: echo "${{ secrets.STUP_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Sign
+        env:
+          STUP_KEYSTORE: ${{ runner.temp }}/release.jks
+          STUP_STORE_PASSWORD: ${{ secrets.STUP_KEYSTORE_PASSWORD }}
+          STUP_KEY_ALIAS: ${{ secrets.STUP_KEY_ALIAS }}
+          STUP_KEY_PASSWORD: ${{ secrets.STUP_KEY_PASSWORD }}
+        run: bash scripts/sign.sh
+
+      - name: Remove the decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+      # Fails before anything is published if the APKs are signed with the wrong key.
+      - name: Verify the signing certificate
+        run: bash scripts/verify-signature.sh "$EXPECTED_CERT_SHA256"
+
+      - name: Source tarball and checksums
+        run: |
+          set -euo pipefail
+          bash scripts/make-source-tarball.sh
+          cd out/signed && sha256sum -- *.apk *.tar.gz > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: out/signed/*.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          draft: ${{ vars.RELEASE_PUBLISH != 'true' }}
+          body_path: release-notes/${{ env.TAG }}.md
+          files: |
+            out/signed/*.apk
+            out/signed/*.tar.gz
+            out/signed/SHA256SUMS.txt

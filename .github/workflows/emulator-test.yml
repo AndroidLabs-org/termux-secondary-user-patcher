@@ -1,0 +1,28 @@
+name: Emulator test
+
+# Manual. Runs scripts/test-emulator.sh on an x86_64 emulator with KVM. Rooting the AVD with
+# Magisk is the open spike (docs/TESTING.md); until then this only covers user 0 and the
+# non-root secondary-user checks, and prints SKIP for the rest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id: { description: "Build run id whose unsigned x86_64 APK to test", required: true }
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: actions/download-artifact@v4
+        with: { name: unsigned-apks, path: apks, run-id: "${{ inputs.run_id }}", github-token: "${{ github.token }}" }
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          script: bash scripts/test-emulator.sh "$(ls apks/*x86_64*.apk | head -1)"

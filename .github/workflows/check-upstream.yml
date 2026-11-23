@@ -1,0 +1,73 @@
+name: Check upstream
+
+# Daily: is there a newer stable termux-app release than upstream.lock pins?
+#   - patches apply   -> open a PR bumping the lock (Build workflow gates it; auto-merged when
+#                        the repository variable AUTO_MERGE is "true").
+#   - patches conflict -> open (or update) ONE issue naming the failing patch. Nothing is released
+#                        and users stay on the last working version.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Find the latest stable upstream release
+        id: up
+        run: |
+          set -euo pipefail
+          # /releases/latest excludes prereleases and drafts, so betas never get picked up.
+          TAG=$(gh api repos/termux/termux-app/releases/latest --jq .tag_name)
+          SHA=$(git ls-remote https://github.com/termux/termux-app.git "refs/tags/$TAG^{}" "refs/tags/$TAG" | tail -1 | cut -f1)
+          CUR=$(sed -n 's/^UPSTREAM_TAG=//p' upstream.lock)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"; echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$TAG" = "$CUR" ]; then echo "up to date ($CUR)"; echo "new=false" >> "$GITHUB_OUTPUT"; else echo "new=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Try the patches on the new release
+        if: steps.up.outputs.new == 'true'
+        id: try
+        run: |
+          set -euo pipefail
+          TAG=${{ steps.up.outputs.tag }}
+          # The patch series is per upstream base. A first try reuses the previous series.
+          OLD=$(sed -n 's/^UPSTREAM_TAG=//p' upstream.lock)
+          if [ ! -d "patches/$TAG" ]; then cp -r "patches/$OLD" "patches/$TAG"; fi
+          sed -i "s/^UPSTREAM_TAG=.*/UPSTREAM_TAG=$TAG/; s/^UPSTREAM_SHA=.*/UPSTREAM_SHA=${{ steps.up.outputs.sha }}/; s/^MU=.*/MU=1/" upstream.lock
+          if bash scripts/apply-patches.sh; then echo "applies=true" >> "$GITHUB_OUTPUT"
+          else echo "applies=false" >> "$GITHUB_OUTPUT"; echo "failed=$(cat build/failed-patch.txt 2>/dev/null || echo unknown)" >> "$GITHUB_OUTPUT"; fi
+        continue-on-error: true
+
+      - name: Open a bump PR
+        if: steps.up.outputs.new == 'true' && steps.try.outputs.applies == 'true'
+        run: |
+          set -euo pipefail
+          TAG=${{ steps.up.outputs.tag }}; BR="upstream/$TAG"
+          VER=$(bash -c '. scripts/lib.sh; load_lock; echo $RELEASE_TAG')
+          printf 'Termux Secondary User Patcher %s\n\nRebased on upstream termux-app %s. The patch series applies cleanly; no code was changed by hand.\n' "${VER#v}" "$TAG" > "release-notes/$VER.md"
+          git config user.name AndroidLabs-org; git config user.email info@androidlabs.org
+          git checkout -b "$BR"; git add -A patches upstream.lock release-notes
+          git commit -m "Bump upstream to $TAG" --date="$(date -u +%Y-%m-%dT12:00:00+0000)"
+          git push -f origin "$BR"
+          URL=$(gh pr create --base main --head "$BR" --title "Bump upstream to $TAG" \
+                  --body "Automatic. Patches apply on $TAG; the Build workflow builds the APKs." || gh pr view "$BR" --json url --jq .url)
+          if [ "${{ vars.AUTO_MERGE }}" = "true" ]; then gh pr merge "$URL" --auto --squash; fi
+
+      - name: Open an issue when a patch conflicts
+        if: steps.up.outputs.new == 'true' && steps.try.outputs.applies == 'false'
+        run: |
+          TAG=${{ steps.up.outputs.tag }}
+          TITLE="Patch ${{ steps.try.outputs.failed }} fails on $TAG"
+          if [ -z "$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number')" ]; then
+            gh issue create --title "$TITLE" --body "The daily check found termux-app $TAG, but the patch series does not apply (failing patch: ${{ steps.try.outputs.failed }}). No release was made; users stay on the last working version. Port the patch (scripts/export-patches.sh) and the pipeline reruns."
+          fi
